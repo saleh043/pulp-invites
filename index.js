@@ -3,7 +3,6 @@ import {
   Client,
   Events,
   GatewayIntentBits,
-  PermissionFlagsBits,
 } from 'discord.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -13,8 +12,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'invites.json');
 const PREFIX = '-inv';
+const RESET_PREFIX = '-resetinv';
 const fakeAccountAgeDays = Number(process.env.FAKE_ACCOUNT_AGE_DAYS ?? 7);
 const fakeAccountAgeMs = fakeAccountAgeDays * 24 * 60 * 60 * 1000;
+const inviteResetterIds = new Set(
+  (process.env.INVITE_RESETTER_IDS ?? '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean),
+);
 
 if (!process.env.DISCORD_TOKEN) {
   throw new Error('DISCORD_TOKEN is missing. Copy .env.example to .env and add your token.');
@@ -54,7 +60,9 @@ function saveDatabase() {
 }
 
 function getGuildData(guildId) {
-  database.guilds[guildId] ??= { members: {} };
+  database.guilds[guildId] ??= { members: {}, resets: {} };
+  database.guilds[guildId].members ??= {};
+  database.guilds[guildId].resets ??= {};
   return database.guilds[guildId];
 }
 
@@ -82,8 +90,12 @@ async function findUsedInvite(guild) {
 }
 
 function getInviteStats(guildId, inviterId) {
-  const members = getGuildData(guildId).members;
-  const invitedMembers = Object.values(members).filter((member) => member.inviterId === inviterId);
+  const guildData = getGuildData(guildId);
+  const resetAt = guildData.resets[inviterId] ?? 0;
+  const invitedMembers = Object.values(guildData.members).filter(
+    (member) => member.inviterId === inviterId
+      && new Date(member.creditedAt ?? member.joinedAt).getTime() > resetAt,
+  );
   const regular = invitedMembers.filter((member) => !member.isFake && !member.left).length;
   const left = invitedMembers.filter((member) => member.left).length;
   const fake = invitedMembers.filter((member) => member.isFake && !member.left).length;
@@ -125,6 +137,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
   guildData.members[member.id] = {
     inviterId: usedInvite.inviterId,
     inviteCode: usedInvite.code,
+    creditedAt: new Date().toISOString(),
     joinedAt: new Date().toISOString(),
     lastJoinedAt: new Date().toISOString(),
     left: false,
@@ -142,7 +155,29 @@ client.on(Events.GuildMemberRemove, async (member) => {
 });
 
 client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot || !message.guild || !message.content.toLowerCase().startsWith(PREFIX)) return;
+  if (message.author.bot || !message.guild) return;
+
+  const command = message.content.trim().split(/\s+/, 1)[0].toLowerCase();
+
+  if (command === RESET_PREFIX) {
+    if (!inviteResetterIds.has(message.author.id)) {
+      await message.reply('You are not allowed to reset invite counters.');
+      return;
+    }
+
+    const target = message.mentions.members.first();
+    if (!target) {
+      await message.reply('Use `-resetinv @member`.');
+      return;
+    }
+
+    getGuildData(message.guild.id).resets[target.id] = Date.now();
+    await saveDatabase();
+    await message.reply(`Reset ${target.user.tag}'s invite counter.`);
+    return;
+  }
+
+  if (command !== PREFIX) return;
 
   const remainder = message.content.slice(PREFIX.length).trim();
   const target = message.mentions.members.first() ?? message.member;
